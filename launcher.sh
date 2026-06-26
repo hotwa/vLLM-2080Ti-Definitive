@@ -662,6 +662,40 @@ list_nvidia_gpus() {
     '
 }
 
+warn_display_gpu_occupancy() {
+  local devices=${GPU_DEVICES:-}
+  local device pids pid comm args found=0
+
+  command -v fuser >/dev/null 2>&1 || return 0
+  devices=${devices// /}
+  [[ -n "$devices" ]] || return 0
+
+  IFS=',' read -r -a parts <<< "$devices"
+  for device in "${parts[@]}"; do
+    [[ "$device" =~ ^[0-9]+$ && -e "/dev/nvidia${device}" ]] || continue
+    pids=$(fuser "/dev/nvidia${device}" 2>/dev/null || true)
+    [[ -n "$pids" ]] || continue
+    for pid in $pids; do
+      [[ "$pid" =~ ^[0-9]+$ ]] || continue
+      comm=$(ps -p "$pid" -o comm= 2>/dev/null || true)
+      args=$(ps -p "$pid" -o args= 2>/dev/null || true)
+      case "$comm $args" in
+        *Xorg*|*Xwayland*|*gnome-shell*|*kwin*|*plasmashell*|*Hyprland*|*sway*|*gdm*|*sddm*|*lightdm*)
+          if (( found == 0 )); then
+            echo
+            echo "Display GPU warning"
+            echo "  A desktop/display process is using one of the selected compute GPUs."
+            echo "  This reduces available VRAM and can lower the maximum stable context."
+            echo "  Prefer an iGPU or a non-compute display GPU for large-context profiles."
+            found=1
+          fi
+          printf '  GPU %s: pid=%s %s\n' "$device" "$pid" "${comm:-unknown}"
+          ;;
+      esac
+    done
+  done
+}
+
 profile_summary() {
   local profile_file=$1
   [[ -f "$profile_file" ]] || return 0
@@ -2870,6 +2904,101 @@ wait_for_ready() {
   return 2
 }
 
+cold_compile_admission_failure() {
+  local log_file=$1
+
+  [[ "${VLLM_COMPILE_PREWARM_RETRY:-0}" != "1" ]] || return 1
+  [[ "${VLLM_COMPILE_PREWARM:-1}" != "0" ]] || return 1
+  [[ -s "$log_file" ]] || return 1
+
+  grep -qE 'To serve at least one request.*max seq len|estimated maximum model length is [0-9]+' "$log_file" 2>/dev/null || return 1
+  grep -qE 'Compiling a graph|Cache the graph of compile range|saved AOT compiled function|Dynamo bytecode transform time' "$log_file" 2>/dev/null || return 1
+  return 0
+}
+
+cold_compile_prewarm_len() {
+  local log_file=$1
+  local target=${MAX_MODEL_LEN:-0}
+  local estimate len
+
+  [[ "$target" =~ ^[0-9]+$ && "$target" -gt 0 ]] || return 1
+  estimate=$(grep -Eo 'estimated maximum model length is [0-9]+' "$log_file" 2>/dev/null | awk '{print $NF}' | tail -n 1)
+  if [[ "$estimate" =~ ^[0-9]+$ && "$estimate" -gt 4096 ]]; then
+    len=$((estimate - 4096))
+  else
+    len=$((target * 4 / 5))
+  fi
+  (( len > 4096 )) || return 1
+  len=$((len / 1024 * 1024))
+  (( len >= 4096 && len < target )) || return 1
+  echo "$len"
+}
+
+run_compile_prewarm() {
+  local host_arg=$1
+  local url_host=$2
+  local prewarm_len=$3
+  local original_len=$MAX_MODEL_LEN
+  local original_name=$SERVED_NAME
+  local original_pid=${CURRENT_SERVER_PID:-}
+  local prewarm_name prewarm_safe prewarm_log prewarm_pid_file args_text ready_rc=0
+
+  prewarm_name="${SERVED_NAME}-compile-prewarm-${prewarm_len}"
+  prewarm_safe=$(printf '%s' "$prewarm_name" | tr -c 'A-Za-z0-9_.-' '_' | sed 's/_*$//')
+  [[ -n "$prewarm_safe" ]] || prewarm_safe="vllm-compile-prewarm"
+  prewarm_log="$LOG_DIR/vllm-${prewarm_safe}-${STAMP}.log"
+  prewarm_pid_file="$LOG_DIR/vllm-${prewarm_safe}.pid"
+
+  MAX_MODEL_LEN=$prewarm_len
+  SERVED_NAME=$prewarm_name
+  build_args "$host_arg"
+  printf -v args_text '%q ' "${VLLM_ARGS[@]}"
+
+  {
+    echo "============================================================"
+    echo "$PROJECT_NAME v$VERSION compile prewarm"
+    echo "Launch time: $(date '+%F %T %Z')"
+    echo "Original served name: $original_name"
+    echo "Original max model len: $original_len"
+    echo "Prewarm max model len: $prewarm_len"
+    echo "Model: $MODEL_DIR"
+    echo "Mode: $MODE"
+    echo "GPU devices: ${GPU_DEVICES:-}"
+    echo "TP size: ${TP_SIZE:-}"
+    echo "Command: $RUNTIME_ROOT/.venv/bin/python -m vllm.entrypoints.openai.api_server $args_text"
+    echo "============================================================"
+  } > "$prewarm_log"
+
+  echo
+  echo "Cold compile admission failure detected."
+  echo "Running compile prewarm at max_model_len=$prewarm_len, then retrying the original $original_len context."
+  echo "  Prewarm log: $prewarm_log"
+
+  if command -v setsid >/dev/null 2>&1; then
+    nohup setsid "$RUNTIME_ROOT/.venv/bin/python" -m vllm.entrypoints.openai.api_server "${VLLM_ARGS[@]}" >>"$prewarm_log" 2>&1 &
+  else
+    nohup "$RUNTIME_ROOT/.venv/bin/python" -m vllm.entrypoints.openai.api_server "${VLLM_ARGS[@]}" >>"$prewarm_log" 2>&1 &
+  fi
+  CURRENT_SERVER_PID=$!
+  echo "$CURRENT_SERVER_PID" > "$prewarm_pid_file"
+
+  wait_for_ready "$prewarm_log" "$url_host" || ready_rc=$?
+  cleanup_failed_launch "$prewarm_pid_file" || true
+
+  MAX_MODEL_LEN=$original_len
+  SERVED_NAME=$original_name
+  CURRENT_SERVER_PID=$original_pid
+  build_args "$host_arg"
+
+  if [[ "$ready_rc" == "0" ]]; then
+    echo "Compile prewarm: OK"
+    return 0
+  fi
+
+  echo "Compile prewarm failed. See: $prewarm_log" >&2
+  return 1
+}
+
 smoke_test() {
   local url_host=$1
   local model_id model_output
@@ -2969,6 +3098,7 @@ launch_server() {
   fi
 
   check_checkpoint_mmap_policy || return 1
+  warn_display_gpu_occupancy || true
 
   {
     echo "============================================================"
@@ -3013,6 +3143,24 @@ launch_server() {
   local ready_rc=0
   wait_for_ready "$log_file" "$url_host" || ready_rc=$?
   if [[ "$ready_rc" != "0" ]]; then
+    local prewarm_len retry_rc
+    if cold_compile_admission_failure "$log_file"; then
+      prewarm_len=$(cold_compile_prewarm_len "$log_file" || true)
+      if [[ -n "$prewarm_len" ]]; then
+        cleanup_failed_launch "$pid_file"
+        if run_compile_prewarm "$host_arg" "$url_host" "$prewarm_len"; then
+          echo
+          echo "Retrying original launch after compile prewarm..."
+          local old_stamp=$STAMP
+          STAMP=$(date +%Y%m%d-%H%M%S)
+          VLLM_COMPILE_PREWARM_RETRY=1 launch_server
+          retry_rc=$?
+          STAMP=$old_stamp
+          unset VLLM_COMPILE_PREWARM_RETRY
+          return "$retry_rc"
+        fi
+      fi
+    fi
     echo
     echo "START FAILED"
     echo "Log: $log_file"
