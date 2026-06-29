@@ -77,13 +77,66 @@ detect_cpu_threads() {
   echo "$threads"
 }
 
+detect_memory_gb() {
+  local mem_kb mem_gb
+  mem_kb=$(awk '/MemTotal:/ { print $2 }' /proc/meminfo 2>/dev/null || echo 0)
+  mem_gb=$(( mem_kb / 1024 / 1024 ))
+  if (( mem_gb < 1 )); then
+    mem_gb=1
+  fi
+  echo "$mem_gb"
+}
+
 select_max_jobs() {
   local threads=$1
-  if (( threads <= 4 )); then
-    echo "$threads"
-  else
-    echo "$((threads - 2))"
+  local jobs
+  jobs=$((threads / 2))
+  (( jobs >= 1 )) || jobs=1
+  echo "$jobs"
+}
+
+validate_max_jobs_range() {
+  local jobs=$1
+  local threads=$2
+  is_positive_integer "$jobs" || fail "MAX_JOBS must be a positive integer."
+  if (( jobs < 1 || jobs > threads )); then
+    fail "MAX_JOBS must be between 1 and CPU_THREADS ($threads)."
   fi
+}
+
+configure_build_parallelism() {
+  local answer
+
+  if [[ "$MAX_JOBS_SOURCE" != "auto" ]]; then
+    return 0
+  fi
+  if [[ "${ASSUME_YES:-0}" == "1" || "${YES:-0}" == "1" || ! -t 0 ]]; then
+    return 0
+  fi
+
+  cat <<EOF
+
+Build thread selection:
+  CPU threads detected: $CPU_THREADS
+  Recommended build threads: $MAX_JOBS
+  Allowed range: 1-$CPU_THREADS
+
+Press Enter to use the recommended value, or type a build thread count:
+EOF
+
+  while true; do
+    read -r answer
+    if [[ -z "$answer" ]]; then
+      return 0
+    fi
+    if is_positive_integer "$answer" && (( answer >= 1 && answer <= CPU_THREADS )); then
+      MAX_JOBS="$answer"
+      MAX_JOBS_SOURCE=manual-prompt
+      export MAX_JOBS
+      return 0
+    fi
+    echo "Please enter a number from 1 to $CPU_THREADS, or press Enter for $MAX_JOBS:"
+  done
 }
 
 validate_cuda_dev_files() {
@@ -128,6 +181,7 @@ Expected time:
 
 Build parallelism:
   CPU threads: $CPU_THREADS
+  System memory: ${MEMORY_GB}GB
   MAX_JOBS: $MAX_JOBS ($MAX_JOBS_SOURCE)
 
 It will download Python/CUDA dependencies, compile CUDA extensions, and keep
@@ -826,14 +880,19 @@ CPU_THREADS=${CPU_THREADS:-$(detect_cpu_threads)}
 if ! is_positive_integer "$CPU_THREADS"; then
   fail "CPU_THREADS must be a positive integer when set explicitly."
 fi
+MEMORY_GB=${MEMORY_GB:-$(detect_memory_gb)}
+if ! is_positive_integer "$MEMORY_GB"; then
+  fail "MEMORY_GB must be a positive integer when set explicitly."
+fi
 if [[ -z "${MAX_JOBS:-}" ]]; then
   MAX_JOBS=$(select_max_jobs "$CPU_THREADS")
   MAX_JOBS_SOURCE=auto
 else
-  is_positive_integer "$MAX_JOBS" || fail "MAX_JOBS must be a positive integer."
+  validate_max_jobs_range "$MAX_JOBS" "$CPU_THREADS"
   MAX_JOBS_SOURCE=manual
 fi
 export CPU_THREADS
+export MEMORY_GB
 export MAX_JOBS
 
 cd "$ROOT"
@@ -847,6 +906,7 @@ check_memory_headroom
 check_disk_headroom
 check_gpu_hardware
 check_gpu_topology
+configure_build_parallelism
 
 if [[ -z "${CUDA_HOME:-}" ]]; then
   if [[ -x /usr/local/cuda-12.8/bin/nvcc ]]; then
@@ -882,6 +942,8 @@ export CMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE:-Release}
 export FLASHINFER_ENABLE_AOT=${FLASHINFER_ENABLE_AOT:-1}
 export VLLM_CUTLASS_SRC_DIR=${VLLM_CUTLASS_SRC_DIR:-$CUTLASS_DIR}
 export TRITON_KERNELS_SRC_DIR=${TRITON_KERNELS_SRC_DIR:-"$TRITON_KERNELS_DIR/python/triton_kernels/triton_kernels"}
+export CMAKE_BUILD_PARALLEL_LEVEL=${CMAKE_BUILD_PARALLEL_LEVEL:-$MAX_JOBS}
+export NVCC_THREADS=${NVCC_THREADS:-1}
 
 cat <<EOF | tee -a "$LOG"
 
@@ -898,7 +960,10 @@ Build settings:
   TORCH_CUDA_ARCH_LIST=$TORCH_CUDA_ARCH_LIST
   UV_TORCH_BACKEND=$UV_TORCH_BACKEND
   CPU_THREADS=$CPU_THREADS
+  MEMORY_GB=$MEMORY_GB
   MAX_JOBS=$MAX_JOBS ($MAX_JOBS_SOURCE)
+  CMAKE_BUILD_PARALLEL_LEVEL=$CMAKE_BUILD_PARALLEL_LEVEL
+  NVCC_THREADS=$NVCC_THREADS
   CMAKE_BUILD_TYPE=$CMAKE_BUILD_TYPE
   VENV=$ROOT/.venv
   Python package mirror fallback=${BUILD_PYPI_MIRROR_FALLBACK:-1}
