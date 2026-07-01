@@ -862,6 +862,66 @@ install_torch_from_wheelhouse() {
       "torch==${VALIDATED_TORCH_VERSION}"
 }
 
+install_build_frontend_requirements() {
+  run_uv_pip_with_mirror_fallback "Install build frontend requirements" \
+    install --python .venv/bin/python -U \
+    "pip" \
+    "wheel" \
+    "packaging>=24.2" \
+    "setuptools>=77.0.3,<81.0.0" \
+    "setuptools-scm>=8" \
+    "cmake>=3.26.1" \
+    "ninja"
+}
+
+ensure_build_frontend_tools() {
+  .venv/bin/python - <<'PY'
+from __future__ import annotations
+
+import subprocess
+import sys
+from importlib import import_module
+from pathlib import Path
+
+try:
+    from packaging.version import Version
+except Exception as exc:  # pragma: no cover - hard fail in build script
+    raise SystemExit(f"packaging import failed: {exc}") from exc
+
+required_modules = {
+    "setuptools": ("77.0.3", "81.0.0"),
+    "setuptools_scm": ("8.0.0", None),
+}
+
+for module_name, (min_version, max_exclusive) in required_modules.items():
+    module = import_module(module_name)
+    version = getattr(module, "__version__", None)
+    if version is None:
+        raise SystemExit(f"{module_name} has no __version__")
+    parsed = Version(version)
+    if parsed < Version(min_version):
+        raise SystemExit(f"{module_name} version too old: {version} < {min_version}")
+    if max_exclusive is not None and parsed >= Version(max_exclusive):
+        raise SystemExit(
+            f"{module_name} version too new: {version} >= {max_exclusive}"
+        )
+
+cmake_path = Path(sys.prefix) / "bin" / "cmake"
+if not cmake_path.is_file():
+    raise SystemExit(f"missing venv cmake: {cmake_path}")
+
+output = subprocess.check_output([str(cmake_path), "--version"], text=True)
+first_line = output.splitlines()[0].strip()
+version_text = first_line.rsplit(" ", 1)[-1]
+if Version(version_text) < Version("3.26.1"):
+    raise SystemExit(f"cmake version too old: {version_text} < 3.26.1")
+
+print(f"build_frontend_ok setuptools={import_module('setuptools').__version__} "
+      f"setuptools_scm={import_module('setuptools_scm').__version__} "
+      f"cmake={version_text}")
+PY
+}
+
 run_step() {
   local title=$1
   shift
@@ -1001,15 +1061,16 @@ fi
 
 install_torch_from_wheelhouse
 
-run_uv_pip_with_mirror_fallback "Upgrade build frontend" install --python .venv/bin/python -U pip setuptools wheel
+install_build_frontend_requirements
+run_with_progress "Validate build frontend tools" ensure_build_frontend_tools
 
-if [[ -f requirements/build/cuda.txt ]]; then
-  run_uv_pip_with_mirror_fallback "Install CUDA build requirements" install --python .venv/bin/python -r requirements/build/cuda.txt
-fi
+[[ -f requirements/build/cuda.txt ]] || fail "Missing requirements/build/cuda.txt. Re-sync the repository before building."
+run_uv_pip_with_mirror_fallback "Install CUDA build requirements" install --python .venv/bin/python -r requirements/build/cuda.txt
+run_with_progress "Re-validate build frontend tools" ensure_build_frontend_tools
 
-if [[ -f requirements/cuda.txt ]]; then
-  run_uv_pip_with_mirror_fallback "Install CUDA runtime requirements" install --python .venv/bin/python -r requirements/cuda.txt
-fi
+[[ -f requirements/cuda.txt ]] || fail "Missing requirements/cuda.txt. Re-sync the repository before building."
+run_uv_pip_with_mirror_fallback "Install CUDA runtime requirements" install --python .venv/bin/python -r requirements/cuda.txt
+run_with_progress "Re-validate build frontend tools after runtime deps" ensure_build_frontend_tools
 
 patch_flashqla_sm75_imports() {
   python - "$FLASHQLA_DIR" "$ROOT/tools/flashqla_sm75_patches" <<'PY'
