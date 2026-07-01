@@ -177,8 +177,9 @@ class cmake_build_ext(build_ext):
                 if nvcc_version >= Version("11.2"):
                     # `nvcc_threads` is either the value of the NVCC_THREADS
                     # environment variable (if defined) or 1.
-                    # when it is set, we reduce `num_jobs` to avoid
-                    # overloading the system.
+                    # It should not silently reduce the outer build parallelism:
+                    # `MAX_JOBS` is the actual build fan-out, while
+                    # `NVCC_THREADS` only controls nvcc's internal threading.
                     nvcc_threads = envs.NVCC_THREADS
                     if nvcc_threads is not None:
                         nvcc_threads = int(nvcc_threads)
@@ -188,7 +189,6 @@ class cmake_build_ext(build_ext):
                         )
                     else:
                         nvcc_threads = 1
-                    num_jobs = max(1, num_jobs // nvcc_threads)
             except Exception as e:
                 logger.warning("Failed to get NVCC version: %s", e)
 
