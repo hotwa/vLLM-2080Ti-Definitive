@@ -9,12 +9,14 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 import vllm.envs as envs
+from vllm.config import CUDAGraphMode
 from vllm import _custom_ops as ops
 from vllm.distributed.device_communicators.all_reduce_utils import (
     CUSTOM_ALL_REDUCE_MAX_SIZES,
     gpu_p2p_access_check,
 )
 from vllm.distributed.parallel_state import in_the_same_node_as
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
@@ -263,6 +265,30 @@ class CustomAllreduce:
             )
         return out
 
+    def _use_registered_graph_inputs(self) -> bool:
+        graph_input_mode = envs.VLLM_CUSTOM_ALLREDUCE_GRAPH_INPUT_MODE
+        if graph_input_mode == "registered":
+            return True
+        if graph_input_mode == "staging":
+            return False
+        if graph_input_mode != "auto":
+            raise ValueError(
+                "VLLM_CUSTOM_ALLREDUCE_GRAPH_INPUT_MODE must be one of "
+                f"auto, registered, or staging. Got {graph_input_mode!r}."
+            )
+
+        # Full decode graphs use stable decode-size graph allocations and keep
+        # the fast registered custom-AR path. Piecewise/prefill graphs may use
+        # graph-private large allocations that cannot be exported with CUDA IPC
+        # on SM75, so they go through the pre-registered staging buffer.
+        if not is_forward_context_available():
+            return False
+        try:
+            forward_context = get_forward_context()
+        except AssertionError:
+            return False
+        return forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL
+
     def custom_all_reduce(self, input: torch.Tensor) -> torch.Tensor | None:
         """The main allreduce API that provides support for cuda graph."""
         # When custom allreduce is disabled, this will be None.
@@ -270,7 +296,9 @@ class CustomAllreduce:
             return None
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
-                return self.all_reduce(input, registered=True)
+                return self.all_reduce(
+                    input, registered=self._use_registered_graph_inputs()
+                )
             else:
                 # If warm up, mimic the allocation pattern since custom
                 # allreduce is out-of-place.
