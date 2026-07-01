@@ -880,6 +880,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from importlib.metadata import version as pkg_version
 from importlib import import_module
 from pathlib import Path
 
@@ -895,9 +896,7 @@ required_modules = {
 
 for module_name, (min_version, max_exclusive) in required_modules.items():
     module = import_module(module_name)
-    version = getattr(module, "__version__", None)
-    if version is None:
-        raise SystemExit(f"{module_name} has no __version__")
+    version = getattr(module, "__version__", None) or pkg_version(module_name.replace("_", "-"))
     parsed = Version(version)
     if parsed < Version(min_version):
         raise SystemExit(f"{module_name} version too old: {version} < {min_version}")
@@ -916,8 +915,8 @@ version_text = first_line.rsplit(" ", 1)[-1]
 if Version(version_text) < Version("3.26.1"):
     raise SystemExit(f"cmake version too old: {version_text} < 3.26.1")
 
-print(f"build_frontend_ok setuptools={import_module('setuptools').__version__} "
-      f"setuptools_scm={import_module('setuptools_scm').__version__} "
+print(f"build_frontend_ok setuptools={pkg_version('setuptools')} "
+      f"setuptools_scm={pkg_version('setuptools-scm')} "
       f"cmake={version_text}")
 PY
 }
