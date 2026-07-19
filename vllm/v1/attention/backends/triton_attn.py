@@ -94,6 +94,11 @@ _INT8KV_DEBUG_VERIFY = os.getenv("VLLM_INT8KV_DEBUG_VERIFY", "0") == "1"
 _INT8KV_DEBUG_VERIFY_USED = 0
 _INT8KV_DEBUG_COMPARE = os.getenv("VLLM_INT8KV_DEBUG_COMPARE", "0") == "1"
 _INT8KV_DEBUG_COMPARE_USED = 0
+_SM75_INT8_DECODE = os.getenv("VLLM_SM75_INT8_DECODE", "0") == "1"
+_SM75_INT8_DECODE_MIN_TOKENS_PER_QUERY = int(
+    os.getenv("VLLM_SM75_INT8_DECODE_MIN_TOKENS_PER_QUERY", "256")
+)
+_SM75_INT8_DECODE_USED = 0
 _GEMMA4_SM75_SDPA_PREFILL512 = (
     os.getenv("VLLM_GEMMA4_SM75_SDPA_PREFILL512", "0") == "1"
 )
@@ -316,6 +321,7 @@ class TritonAttentionMetadata:
     prefix_scheduler_metadata: torch.Tensor | None = None
     mm_prefix_range: dict[int, list[tuple[int, int]]] | None = None
     mm_prefix_range_tensor: torch.Tensor | None = None
+    is_for_cudagraph_capture: bool = False
 
     @staticmethod
     def compute_mm_prefix_range_tensor(
@@ -435,6 +441,7 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
         # max_model_len will cause graph capture to be extremely
         # slow, so here we set it to 1.
         attn_metadata.seq_lens.fill_(1)
+        attn_metadata.is_for_cudagraph_capture = True
         return attn_metadata
 
     def build(
@@ -768,6 +775,109 @@ class TritonAttentionImpl(AttentionImpl):
             ref[0, :8].detach().cpu().tolist(),
         )
 
+    def _try_sm75_int8_decode(
+        self,
+        query: torch.Tensor,
+        output: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        k_scale_cache: torch.Tensor | None,
+        v_scale_cache: torch.Tensor | None,
+        attn_metadata: TritonAttentionMetadata,
+        num_actual_tokens: int,
+        output_scale: torch.Tensor | None,
+        output_block_scale: torch.Tensor | None,
+    ) -> bool:
+        """Use the native Turing INT8 Tensor Core decode prototype.
+
+        This path intentionally targets the TP=2 Ornith/Qwen3.5 35B rank
+        shape. All other shapes and features retain the existing Triton path.
+        It accepts one decode token or up to four causal MTP verification
+        tokens. CUDA graph capture falls back because this first version
+        receives the sequence length as a host launch parameter.
+        """
+        if not self._sm75_int8_decode_eligible:
+            return False
+        if self.kv_cache_dtype != "int8_per_token_head":
+            return False
+        if self.attn_type != AttentionType.DECODER:
+            return False
+        if (
+            num_actual_tokens < 1
+            or num_actual_tokens > 4
+            or attn_metadata.max_query_len != num_actual_tokens
+            or attn_metadata.seq_lens_cpu is None
+            or attn_metadata.seq_lens_cpu.numel() != 1
+            or attn_metadata.block_table.shape[0] != 1
+            or query.shape[0] != num_actual_tokens
+            or output.shape[0] != num_actual_tokens
+        ):
+            return False
+        if (
+            self.num_heads != 8
+            or self.num_kv_heads != 1
+            or self.head_size != 256
+        ):
+            return False
+        if (
+            query.dtype != torch.float16
+            or output.dtype != torch.float16
+            or key_cache.dtype != torch.int8
+            or value_cache.dtype != torch.int8
+            or query.stride(-1) != 1
+            or output.stride(-1) != 1
+        ):
+            return False
+        if k_scale_cache is None or v_scale_cache is None:
+            return False
+        if output_scale is not None or output_block_scale is not None:
+            return False
+        if (
+            self.alibi_slopes is not None
+            or self.use_alibi_sqrt
+            or self.sliding_window != (-1, -1)
+            or self.logits_soft_cap != 0
+            or self.sinks is not None
+            or self.chunk_lookback != -1
+            or attn_metadata.mm_prefix_range_tensor is not None
+        ):
+            return False
+        if attn_metadata.is_for_cudagraph_capture:
+            return False
+
+        seq_len = int(attn_metadata.seq_lens_cpu[0])
+        if seq_len < _SM75_INT8_DECODE_MIN_TOKENS_PER_QUERY * num_actual_tokens:
+            return False
+
+        from vllm.v1.attention.ops.sm75_int8_decode_attention import (
+            attention_out,
+            get_workspace,
+        )
+
+        workspaces = get_workspace(seq_len, query.device)
+        attention_out(
+            query,
+            key_cache,
+            value_cache,
+            k_scale_cache,
+            v_scale_cache,
+            attn_metadata.block_table,
+            workspaces,
+            output,
+            seq_len,
+            self.scale,
+        )
+
+        global _SM75_INT8_DECODE_USED
+        _SM75_INT8_DECODE_USED += 1
+        if _SM75_INT8_DECODE_USED <= 4:
+            logger.info(
+                "SM75 native INT8 decode used count=%d seq_len=%d",
+                _SM75_INT8_DECODE_USED,
+                seq_len,
+            )
+        return True
+
     def _ensure_scale_caches(self, kv_cache: torch.Tensor) -> None:
         """Extract per-head scale views from the padded head dimension.
 
@@ -879,6 +989,11 @@ class TritonAttentionImpl(AttentionImpl):
 
         self._kv_quant_mode = get_kv_quant_mode(kv_cache_dtype)
         self._is_per_token_head_quant = self._kv_quant_mode.is_per_token_head
+        self._sm75_int8_decode_eligible = (
+            _SM75_INT8_DECODE
+            and current_platform.is_cuda()
+            and torch.cuda.get_device_capability() == (7, 5)
+        )
 
     def _flashinfer_indptr(
         self,
@@ -1840,6 +1955,20 @@ class TritonAttentionImpl(AttentionImpl):
             v_descale = layer._v_scale.expand(descale_shape)
             k_scale_cache = None
             v_scale_cache = None
+
+        if self._try_sm75_int8_decode(
+            query,
+            output,
+            key_cache,
+            value_cache,
+            k_scale_cache,
+            v_scale_cache,
+            attn_metadata,
+            num_actual_tokens,
+            output_scale,
+            output_block_scale,
+        ):
+            return output
 
         cu_seqlens_q = attn_metadata.query_start_loc
         seqused_k = attn_metadata.seq_lens
