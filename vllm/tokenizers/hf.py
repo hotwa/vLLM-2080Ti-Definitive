@@ -178,10 +178,25 @@ class CachedHfTokenizer(TokenizerLike):
                 **kwargs,
             )
         except ValueError as e:
+            if "Tokenizer class TokenizersBackend" in str(e):
+                # TokenizersBackend is the Transformers 5 name for the generic
+                # tokenizer.json implementation. Keep this fork's supported
+                # Transformers 4.x runtime working, then apply vLLM's normal
+                # cached-tokenizer wrapper below.
+                from transformers import PreTrainedTokenizerFast
+
+                tokenizer = PreTrainedTokenizerFast.from_pretrained(
+                    path_or_repo_id,
+                    *args,
+                    trust_remote_code=trust_remote_code,
+                    revision=revision,
+                    cache_dir=download_dir,
+                    **kwargs,
+                )
             # If the error pertains to the tokenizer class not existing or not
             # currently being imported,
             # suggest using the --trust-remote-code flag.
-            if not trust_remote_code and (
+            elif not trust_remote_code and (
                 "does not exist or is not currently imported." in str(e)
                 or "requires you to execute the tokenizer file" in str(e)
             ):
