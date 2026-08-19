@@ -597,6 +597,9 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         needs_squeeze = hidden_states.dim() == 1
         if needs_squeeze:
             hidden_states = hidden_states.unsqueeze(0)
+        fc_dtype = self.model.fc.weight.dtype
+        if hidden_states.dtype != fc_dtype:
+            hidden_states = hidden_states.to(fc_dtype)
         result = self.model.fc(hidden_states)
         if needs_squeeze:
             result = result.squeeze(0)
