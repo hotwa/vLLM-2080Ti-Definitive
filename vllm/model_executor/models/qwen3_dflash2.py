@@ -20,7 +20,6 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from vllm.compilation.decorators import support_torch_compile
 from vllm.config import CacheConfig, VllmConfig
 from vllm.distributed import (
     get_tensor_model_parallel_world_size,
@@ -301,7 +300,9 @@ def _score_edges(
     )
 
 
-@support_torch_compile
+# Not compiled: the selector is invoked from the proposer walk with
+# varying inputs, which breaks this fork's piecewise CUDA-graph replay
+# input bookkeeping. It is small enough to run eagerly.
 class CandidateSelector(nn.Module):
     def __init__(
         self,

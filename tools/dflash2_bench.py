@@ -51,7 +51,7 @@ WORKLOADS = {
         '"expected_result", for the task: fetch a GitHub pull request, list '
         'its changed files, run the test suite, and post a summary comment. '
         "Repeat the schema for three different repositories and add a final "
-        '"validation" section listing invariants to check.",
+        '"validation" section listing invariants to check.',
         512,
     ),
 }
