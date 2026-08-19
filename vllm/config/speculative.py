@@ -1050,6 +1050,18 @@ class SpeculativeConfig:
     def use_dflash(self) -> bool:
         return self.method == "dflash"
 
+    def use_dflash2(self) -> bool:
+        """Whether the dflash draft is a DFlash2 checkpoint, by the same
+        architecture the model registry resolves on."""
+        if not self.use_dflash():
+            return False
+        draft_config = getattr(self, "draft_model_config", None)
+        if draft_config is None:
+            return False
+        return "DFlash2DraftModel" in (
+            getattr(draft_config, "architectures", None) or []
+        )
+
     def uses_draft_model(self) -> bool:
         return self.method == "draft_model"
 
