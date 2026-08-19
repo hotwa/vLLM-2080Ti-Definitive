@@ -47,6 +47,41 @@ from .utils import (
 logger = init_logger(__name__)
 
 
+def _draft_needs_scaled_residual(config, model_dtype: torch.dtype) -> bool:
+    """True when the draft runs fp16 weights from a bf16-trained checkpoint.
+
+    bf16-trained DFlash drafts have a residual stream that exceeds the fp16
+    dynamic range (values above 65504). RMSNorm is scale-invariant, so the
+    residual stream is carried scaled by _RESIDUAL_SCALE, which keeps it
+    inside the fp16 range without changing the math.
+    """
+    ckpt_dtype = getattr(config, "torch_dtype", None) or getattr(config, "dtype", None)
+    if isinstance(ckpt_dtype, str):
+        ckpt_dtype = getattr(torch, ckpt_dtype, None)
+    return model_dtype == torch.float16 and ckpt_dtype == torch.bfloat16
+
+
+# Observed unscaled residual absmax is ~1.6e5; /16 keeps it and the per-layer
+# MLP outputs (~6.2e4) safely inside the fp16 range.
+_RESIDUAL_SCALE = 1.0 / 16.0
+
+
+def _mlp_scaled(mlp: Qwen3MLP, x: torch.Tensor, scale: float) -> torch.Tensor:
+    """Return scale * MLP(x) without overflowing fp16.
+
+    In bf16-trained DFlash drafts, silu(gate) * up exceeds the fp16 range
+    (~1e5). Compute the activation product in fp32, fold the scale in before
+    casting back to fp16, and let down_proj's linearity absorb it, so the
+    result is exactly scale * MLP(x) in the fp16 weight dtype.
+    """
+    gu, _ = mlp.gate_up_proj(x)
+    gate, up = gu.chunk(2, dim=-1)
+    act = F.silu(gate.to(torch.float32)) * up.to(torch.float32)
+    act = (act * scale).to(gu.dtype)
+    out, _ = mlp.down_proj(act)
+    return out
+
+
 class DFlashQwen3Attention(nn.Module):
     """Attention for DFlash speculative decoding.
 
@@ -145,7 +180,16 @@ class DFlashQwen3Attention(nn.Module):
 
         q, k = self.rotary_emb(positions, q, k)
 
+        # Attention backends need the cache dtype while the draft compute
+        # dtype can in principle be wider. q/k/v are bounded post-norm/RoPE,
+        # so casting to the cache dtype here is safe.
+        compute_dtype = hidden_states.dtype
+        attn_dtype = self.attn.kv_cache_torch_dtype
+        if compute_dtype != attn_dtype:
+            q, k, v = q.to(attn_dtype), k.to(attn_dtype), v.to(attn_dtype)
         attn_output = self.attn(q, k, v)
+        if attn_output.dtype != compute_dtype:
+            attn_output = attn_output.to(compute_dtype)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -190,6 +234,9 @@ class DFlashQwen3DecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
+        self._residual_scaled = _draft_needs_scaled_residual(
+            config, vllm_config.model_config.dtype
+        )
 
     def forward(
         self,
@@ -197,6 +244,30 @@ class DFlashQwen3DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._residual_scaled:
+            # bf16-trained drafts exceed the fp16 range in the residual
+            # stream. RMSNorm is scale-invariant, so carrying the residual
+            # scaled by _RESIDUAL_SCALE (and scaling sublayer outputs before
+            # each fused add+norm) is mathematically identical while staying
+            # in fp16.
+            s = _RESIDUAL_SCALE
+            if residual is not None:
+                hidden_states, residual = self.input_layernorm(hidden_states, residual)
+            else:
+                residual = hidden_states * s
+                hidden_states = self.input_layernorm(residual)
+
+            hidden_states = self.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+            )
+
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states * s, residual
+            )
+            hidden_states = _mlp_scaled(self.mlp, hidden_states, s)
+            return hidden_states, residual
+
         if residual is not None:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
         else:
@@ -239,9 +310,16 @@ class DFlashQwen3Model(nn.Module):
 
         current_vllm_config = get_current_vllm_config()
 
+        # When the draft runs fp32 compute (SM75 fallback), keep the
+        # embedding table fp16: it is shared from the target model anyway,
+        # and an fp32 allocation of vocab x hidden does not fit 22GB GPUs.
+        embed_dtype = vllm_config.model_config.dtype
+        if embed_dtype == torch.float32:
+            embed_dtype = torch.float16
         self.embed_tokens = VocabParallelEmbedding(
             self.config.vocab_size,
             self.config.hidden_size,
+            params_dtype=embed_dtype,
             prefix=maybe_prefix(prefix, "embed_tokens"),
         )
 
@@ -251,6 +329,7 @@ class DFlashQwen3Model(nn.Module):
                     current_vllm_config,
                     prefix=maybe_prefix(prefix, f"layers.{layer_idx + start_layer_id}"),
                     config=self.config,
+                    cache_config=vllm_config.cache_config,
                 )
                 for layer_idx in range(self.config.num_hidden_layers)
             ]
@@ -281,6 +360,9 @@ class DFlashQwen3Model(nn.Module):
         self.norm = RMSNorm(
             self.config.hidden_size,
             eps=self.config.rms_norm_eps,
+        )
+        self._residual_scaled = _draft_needs_scaled_residual(
+            self.config, vllm_config.model_config.dtype
         )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -373,6 +455,8 @@ class DFlashQwen3Model(nn.Module):
         nkv = self._num_kv_heads
 
         # --- Fused KV projection (one GEMM for all layers) ---
+        if context_states.dtype != self._fused_kv_weight.dtype:
+            context_states = context_states.to(self._fused_kv_weight.dtype)
         normed_context_states = torch.empty_like(context_states)
         ops.rms_norm(
             normed_context_states,
@@ -424,6 +508,10 @@ class DFlashQwen3Model(nn.Module):
 
         # --- Per-layer cache insert ---
         all_k_final = all_k_flat.view(L, num_ctx, nkv, hd)
+        cache_dtype = self._attn_layers[0].kv_cache_torch_dtype
+        if all_k_final.dtype != cache_dtype:
+            all_k_final = all_k_final.to(cache_dtype)
+            all_v = all_v.to(cache_dtype)
         for i in range(L):
             attn = self._attn_layers[i]
             kv_cache = attn.kv_cache
@@ -443,6 +531,12 @@ class DFlashQwen3Model(nn.Module):
     ) -> torch.Tensor:
         if input_embeds is None:
             input_embeds = self.embed_input_ids(input_ids)
+
+        # embed_tokens may be shared from the target model (different dtype,
+        # e.g. fp16 target with a bf16 DFlash draft); cast to the draft dtype.
+        layer_dtype = self.norm.weight.dtype
+        if input_embeds.dtype != layer_dtype:
+            input_embeds = input_embeds.to(layer_dtype)
 
         hidden_states = input_embeds
 
@@ -516,7 +610,10 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             )
         if getattr(self.config, "draft_vocab_size", None) is None:
             self.config.draft_vocab_size = getattr(self.config, "vocab_size", None)
-        target_layer_num = vllm_config.model_config.get_num_layers(
+        # The draft VllmConfig's model_config is the draft checkpoint's
+        # config; target geometry comes from the speculative config.
+        target_model_config = vllm_config.speculative_config.target_model_config
+        target_layer_num = target_model_config.get_num_layers(
             vllm_config.parallel_config
         )
         self.config.target_layer_count = target_layer_num
@@ -527,15 +624,20 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         )
 
         logit_scale = getattr(self.config, "logit_scale", 1.0)
+        # fp32-draft fallback: keep lm_head fp16 (shared from the target).
+        lm_head_dtype = vllm_config.model_config.dtype
+        if lm_head_dtype == torch.float32:
+            lm_head_dtype = torch.float16
         self.lm_head = ParallelLMHead(
             self.config.draft_vocab_size,
             self.config.hidden_size,
+            params_dtype=lm_head_dtype,
             prefix=maybe_prefix(prefix, "lm_head"),
         )
         self.logits_processor = LogitsProcessor(
             self.config.draft_vocab_size, scale=logit_scale
         )
-        target_vocab_size = vllm_config.model_config.get_vocab_size()
+        target_vocab_size = target_model_config.get_vocab_size()
         if self.config.draft_vocab_size != target_vocab_size:
             self.draft_id_to_target_id = nn.Parameter(
                 torch.zeros(self.config.draft_vocab_size, dtype=torch.long),

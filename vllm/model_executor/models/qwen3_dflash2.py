@@ -39,6 +39,8 @@ from .qwen3_dflash import (
     DFlashQwen3DecoderLayer,
     DFlashQwen3ForCausalLM,
     DFlashQwen3Model,
+    _RESIDUAL_SCALE,
+    _mlp_scaled,
 )
 from .utils import maybe_prefix
 
@@ -232,6 +234,33 @@ class DFlash2Qwen3DecoderLayer(DFlashQwen3DecoderLayer):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._residual_scaled:
+            # bf16-trained drafts exceed the fp16 range in the residual
+            # stream. RMSNorm is scale-invariant, so carrying the residual
+            # scaled by _RESIDUAL_SCALE (and scaling sublayer outputs before
+            # each fused add+norm) is mathematically identical while staying
+            # in fp16.
+            s = _RESIDUAL_SCALE
+            if residual is None:
+                residual = hidden_states * s
+                hidden_states = self.input_layernorm(residual)
+            else:
+                hidden_states, residual = self.input_layernorm(hidden_states, residual)
+
+            hidden_states, coefficients = self.attention_conv.prepare(hidden_states)
+            hidden_states = self.self_attn(
+                positions=positions, hidden_states=hidden_states
+            )
+            hidden_states = self.attention_conv.finish(hidden_states * s, coefficients)
+
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual
+            )
+            hidden_states, coefficients = self.mlp_conv.prepare(hidden_states)
+            hidden_states = _mlp_scaled(self.mlp, hidden_states, s)
+            hidden_states = self.mlp_conv.finish(hidden_states, coefficients)
+            return hidden_states, residual
+
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -377,6 +406,11 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
             )
 
         selector = self.model.candidate_selector
+        # lm_head is shared from the target model and may use a different
+        # dtype (e.g. fp16 target, bf16 DFlash2 draft).
+        lm_head_dtype = self.lm_head.weight.dtype
+        if hidden_states.dtype != lm_head_dtype:
+            hidden_states = hidden_states.to(lm_head_dtype)
         logits = self.lm_head.quant_method.apply(self.lm_head, hidden_states, bias=None)
         num_pad = self.lm_head.shard_indices.num_org_vocab_padding
         if num_pad > 0:
