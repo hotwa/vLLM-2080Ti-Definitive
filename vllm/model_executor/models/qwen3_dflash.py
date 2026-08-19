@@ -215,6 +215,8 @@ class DFlashQwen3DecoderLayer(nn.Module):
 
 @support_torch_compile
 class DFlashQwen3Model(nn.Module):
+    decoder_layer_cls = DFlashQwen3DecoderLayer
+
     def __init__(
         self,
         *,
@@ -245,7 +247,7 @@ class DFlashQwen3Model(nn.Module):
 
         self.layers = nn.ModuleList(
             [
-                DFlashQwen3DecoderLayer(
+                self.decoder_layer_cls(
                     current_vllm_config,
                     prefix=maybe_prefix(prefix, f"layers.{layer_idx + start_layer_id}"),
                     config=self.config,
@@ -499,16 +501,26 @@ class DFlashQwen3Model(nn.Module):
 
 
 class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
+    model_cls = DFlashQwen3Model
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         nn.Module.__init__(self)
         self.config = vllm_config.speculative_config.draft_model_config.hf_config
+        architectures = getattr(self.config, "architectures", None) or []
+        if "DFlash2DraftModel" in architectures and type(self) is DFlashQwen3ForCausalLM:
+            raise ValueError(
+                "A DFlash2 checkpoint (architectures="
+                f"{architectures}) was routed to the DFlash v1 implementation. "
+                "DFlash2 requires DFlash2Qwen3ForCausalLM; refusing to silently "
+                "draft with DFlash v1 semantics."
+            )
         if getattr(self.config, "draft_vocab_size", None) is None:
             self.config.draft_vocab_size = getattr(self.config, "vocab_size", None)
         target_layer_num = vllm_config.model_config.get_num_layers(
             vllm_config.parallel_config
         )
         self.config.target_layer_count = target_layer_num
-        self.model = DFlashQwen3Model(
+        self.model = self.model_cls(
             vllm_config=vllm_config,
             prefix="model",
             start_layer_id=target_layer_num,
