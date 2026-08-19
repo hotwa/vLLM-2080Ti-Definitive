@@ -71,6 +71,21 @@ class DFlashProposer(SpecDecodeBaseProposer):
     @override
     def _create_draft_vllm_config(self) -> VllmConfig:
         base = super()._create_draft_vllm_config()
+        # Run the draft in its own model config so layer construction uses
+        # the draft checkpoint dtype (DFlash2 checkpoints are bf16 and their
+        # activations overflow fp16).
+        spec_cfg = self.speculative_config
+        base = replace(base, model_config=spec_cfg.draft_model_config)
+        if (
+            spec_cfg.draft_model_config.dtype == torch.float32
+            and base.cache_config.cache_dtype in (None, "auto")
+        ):
+            # fp32 draft compute must not allocate an fp32 KV cache; keep the
+            # draft cache and attention I/O in fp16.
+            base = replace(
+                base,
+                cache_config=replace(base.cache_config, cache_dtype="float16"),
+            )
         return replace(
             base,
             attention_config=replace(
