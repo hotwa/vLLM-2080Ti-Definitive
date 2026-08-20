@@ -103,6 +103,29 @@ Observations:
 - **DFlash2 opt-in profile:** k=5, compile + piecewise cudagraph `[1,2,5,6]`, 32K fp16 KV — useful when an MTP checkpoint is unavailable or for experiments.
 - **Upstream notes:** the scaled-residual trick and the unconditional fp16 draft-KV pin are port-specific but worth mentioning upstream for low-end-hardware users; the page-size-unification limitation with mixed quantized/fp16 spec caches may deserve a generic fix (e.g. page padding for speculative draft caches).
 
+## 9. Base-model experiment (2026-08-20)
+
+**Hypothesis:** DFlash2's low acceptance on Uncensored-FP8 (9–34%) was a distribution mismatch; the incoai-trained draft should match the official base Qwen3.8-27B-FP8 and restore upstream-like ~76% acceptance (PR #52816).
+
+**Method:** served official base Qwen3.8-27B-FP8 (text_config identical to Uncensored — same arch, different weights), 32K ctx, greedy temp=0, single sequence. Benchmarked DFlash2 k=5 cg, DFlash2 k=7 cg (native block_size=8), and MTP3 eager as control.
+
+**Results** (e2e tok/s; coding / reasoning / chat / agent):
+
+| target + spec | coding | reasoning | chat | agent |
+|---|---|---|---|---|
+| Uncensored AR | 27.9 | 27.6 | 27.6 | 27.5 |
+| Uncensored + DFlash2 k=5 cg | 42.3 | 46.4 | 33.1 | 42.7 |
+| Uncensored + MTP3 eager | 59.9 | 65.8 | 45.9 | 59.3 |
+| base + DFlash2 k=5 cg | 38.9 | 39.9 | 33.9 | 41.3 |
+| base + DFlash2 k=7 cg | 34.5 | 34.5 | 29.1 | 38.1 |
+| base + MTP3 eager | 57.3 | 60.9 | 42.3 | 59.0 |
+
+**Acceptance:** base + DFlash2 k=7: 16.2 / 16.9 / 11.9 / 20.1% (mean accepted len 1.13 / 1.18 / 0.84 / 1.41). base + MTP3: 57.5 / 65.5 / 35.9 / 64.6% (mean 4.03 / 4.59 / 2.52 / 4.53). Uncensored + DFlash2 k=5 was 19–34%; Uncensored + MTP3 was 42–75%.
+
+**Conclusion: hypothesis falsified.** The base target did NOT restore DFlash2 acceptance — k=7 acceptance on base (12–20%) is *lower* than k=5 on Uncensored (19–34%), and throughput dropped too (34.5–38.1 vs 42.3–46.4 tok/s). MTP3 performs well on both targets (57–66 tok/s, 36–66% acceptance), isolating the problem to the draft checkpoint: the incoai DFlash2 draft matches neither local 27B weight version. Upstream's ~76% was measured at temp=1.0 / top-p 0.95 / top-k 20 (greedy is the harshest regime for multi-token drafts) and possibly against a different checkpoint revision.
+
+**Final recommendation unchanged:** production stays MTP3 138K; DFlash2 k=5 cg 32K remains the opt-in fallback (~1.68× AR vs MTP3's ~2.1×).
+
 ## Appendix A — validated launch template
 
 ```bash
