@@ -96,7 +96,7 @@ Tested checkpoint target: Qwen/Qwen3.6-35B-A3B-FP8, about 36G.
 | `qwen35b/aggressive/fp8/fp16kv-136K-nomtp-text-image.env` | aggressive | 136K | FP16 | 0 | text+image | 1 | 5422.83 / 124.11 |
 | `qwen35b/fast/fp8/fp16kv-178K-mtp3-text-only.env` | fast | 178K | FP16 | 3 | text-only | 1 | 5889.20 / 195.95 |
 
-### Qwen3.x 27B
+### Qwen3.x 27B (INT4)
 
 Tested checkpoints: QuantTrio/Qwen3.6-27B-AWQ, mconcat/Qwopus3.6-27B-v2-AWQ-4bit,
 and llmfan46/Qwen3.6-27B-uncensored-heretic-v2-Native-MTP-Preserved-GPTQ-Int4,
@@ -111,3 +111,17 @@ about 19G.
 | `qwen27b/fast/int4/fp16kv-256K-mtp3-text-only.env` | fast | 256K | FP16 | 3 | text-only | 1 | 1734.98 / 87.00 |
 | `qwen27b/fast/int4/tqk8v4-256K-mtp3-text-only.env` | fast | 256K | TQK8V4 | 3 | text-only | 1 | 1744.67 / 100.81 |
 | `qwen27b/fast/int4/tqk8v4-two250K-mtp3-text-only.env` | fast | 250K per workspace | TQK8V4 | 3 | text-only | 2 | 1739.23 / 99.91 |
+
+### Qwen3.8-27B (INT4)
+
+Tested checkpoint: [SergiioB/Qwen3.8-27B-GPTQ-Int4-sym-G128-MTP-BF16](https://huggingface.co/SergiioB/Qwen3.8-27B-GPTQ-Int4-sym-G128-MTP-BF16),
+18.22 GB, GPTQ INT4 G128, MTP preserved in BF16.
+
+**Key finding**: Qwen3.8 GPTQ INT4 + FP16 KV + MTP3 achieves **54% faster decode** than Qwen3.6!
+
+| Profile | Compatible modes | Context | KV | MTP | Messages | Seqs | Throughput |
+|---|---|---:|---|---:|---|---:|---:|
+| `qwen38/fast/int4/fp16kv-128K-mtp3-text-only.env` | fast | 128K | FP16 | 3 | text-only | 1 | **1690.7 / 126.2** |
+| `qwen38/normal/int4/int8kv-128K-nomtp-text-only.env` | normal | 128K | INT8 | 0 | text-only | 1 | 1741.4 / 54.7 |
+
+See [docs/benchmarks/qwen38-gptq-int4-benchmark.md](../docs/benchmarks/qwen38-gptq-int4-benchmark.md) for detailed benchmark results.
