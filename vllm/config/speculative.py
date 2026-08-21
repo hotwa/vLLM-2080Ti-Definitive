@@ -687,51 +687,6 @@ class SpeculativeConfig:
                         f"Unsupported speculative method: '{self.method}'"
                     )
 
-                # DFlash draft checkpoints are trained in bfloat16 and their
-                # intermediate activations exceed the fp16 dynamic range
-                # (residual stream overflows to inf/NaN). Run the draft model
-                # in its checkpoint dtype even when the target model runs
-                # fp16; the draft KV cache is pinned to fp16 in
-                # DFlashProposer._create_draft_vllm_config.
-                if self.method == "dflash":
-                    import torch
-
-                    from vllm.platforms import current_platform
-
-                    draft_hf_config = self.draft_model_config.hf_config
-                    ckpt_dtype = getattr(draft_hf_config, "torch_dtype", None)
-                    if not isinstance(ckpt_dtype, torch.dtype):
-                        dtype_str = getattr(draft_hf_config, "dtype", None)
-                        ckpt_dtype = (
-                            getattr(torch, dtype_str, None)
-                            if isinstance(dtype_str, str)
-                            else None
-                        )
-                    if isinstance(ckpt_dtype, torch.dtype):
-                        draft_dtype = ckpt_dtype
-                        if (
-                            ckpt_dtype == torch.bfloat16
-                            and not current_platform.has_device_capability(80)
-                        ):
-                            # Pre-Ampere GPUs lack bf16 device kernels.
-                            # fp32 draft weights do not fit alongside the
-                            # target on 22GB cards, so the draft runs fp16
-                            # weights; DFlashQwen3DecoderLayer carries the
-                            # residual stream scaled by 1/16 (RMSNorm is
-                            # scale-invariant) because bf16-trained DFlash
-                            # activations overflow the fp16 range.
-                            draft_dtype = torch.float16
-                        if self.draft_model_config.dtype != draft_dtype:
-                            logger.info(
-                                "Overriding DFlash draft model dtype %s -> %s "
-                                "(checkpoint dtype is %s; the DFlash draft "
-                                "path overflows fp16).",
-                                self.draft_model_config.dtype,
-                                draft_dtype,
-                                ckpt_dtype,
-                            )
-                            self.draft_model_config.dtype = draft_dtype
-
                 # Replace hf_config for EAGLE draft_model
                 if self.method in ("eagle", "eagle3", "dflash"):
                     from vllm.transformers_utils.configs.eagle import EAGLEConfig
@@ -1094,18 +1049,6 @@ class SpeculativeConfig:
 
     def use_dflash(self) -> bool:
         return self.method == "dflash"
-
-    def use_dflash2(self) -> bool:
-        """Whether the dflash draft is a DFlash2 checkpoint, by the same
-        architecture the model registry resolves on."""
-        if not self.use_dflash():
-            return False
-        draft_config = getattr(self, "draft_model_config", None)
-        if draft_config is None:
-            return False
-        return "DFlash2DraftModel" in (
-            getattr(draft_config, "architectures", None) or []
-        )
 
     def uses_draft_model(self) -> bool:
         return self.method == "draft_model"

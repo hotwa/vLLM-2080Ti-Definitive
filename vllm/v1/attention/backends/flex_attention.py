@@ -391,7 +391,6 @@ class FlexAttentionMetadata:
     direct_build: bool = True
     q_block_size: int = 16
     kv_block_size: int = 16
-    sub_blocks_per_page: int = 1
     transformed_score_mod: _score_mod_signature | None = None
     sliding_window: int | None = None
     mm_prefix_range: dict[int, list[tuple[int, int]]] | None = None
@@ -639,7 +638,7 @@ class FlexAttentionMetadata:
 
         """
         page_to_block_ratio = self.kv_block_size // self.block_size
-        if page_to_block_ratio != 1 and self.sub_blocks_per_page == 1:
+        if page_to_block_ratio != 1:
             raise ValueError(
                 f"FlexAttention currently requires the cache block size "
                 f"({self.block_size}) to be equal to the kv_block_size "
@@ -683,32 +682,15 @@ class FlexAttentionMetadata:
                 )
                 used_pages.masked_fill_(~hint_mask, 0)
 
-        if self.sub_blocks_per_page > 1:
-            # Expand page ids into power-of-2 sub-block ids so the compiled
-            # Triton kernel gets a valid BLOCK_N. Page p covers flat tokens
-            # [p*block_size, (p+1)*block_size); sub-block (p*ratio+j) maps
-            # to flat tokens [(p*ratio+j)*kv_block_size, ...+kv_block_size),
-            # which is exactly tokens [j*kv_block_size, (j+1)*kv_block_size)
-            # inside page p. Sentinel 0 (unused page) stays 0.
-            ratio = self.sub_blocks_per_page
-            sub_offsets = torch.arange(ratio, device=used_pages.device)
-            expanded = used_pages.unsqueeze(-1) * ratio
-            expanded = expanded + torch.where(
-                used_pages.unsqueeze(-1) > 0, sub_offsets, 0
-            )
-            used_pages = expanded.reshape(used_pages.shape[0], -1)
-
         used_pages_padded = pad_to_multiple(
             used_pages, multiple=self.q_block_size, dim=0
         )
         used_pages_padded = used_pages_padded.reshape(
             used_pages_padded.shape[0] // self.q_block_size, -1
         )
-        if self.sub_blocks_per_page == 1:
-            used_pages_padded = used_pages_padded // page_to_block_ratio
+        used_pages_padded = used_pages_padded // page_to_block_ratio
         kv_indices = unique_static_unsorted(
-            (used_pages_padded.long()),
-            M=self.num_blocks * self.sub_blocks_per_page,
+            (used_pages_padded.long()), M=self.num_blocks
         ).to(torch.int32)
         kv_indices = copy_to_persistent(self.persistent_kv_indices, kv_indices)
 
@@ -789,22 +771,13 @@ class FlexAttentionMetadataBuilder(AttentionMetadataBuilder[FlexAttentionMetadat
         self.direct_build: bool = supports_small_blocks
         self.q_block_size: int = 16 if supports_small_blocks else 128
         self.kv_block_size: int = self.block_size if supports_small_blocks else 128
-        # [FORK] Triton requires power-of-2 block sizes. Hybrid models can
-        # force non-power-of-2 KV pages (e.g. 832 tokens to align with the
-        # mamba page size); subdivide such pages into the largest
-        # power-of-2 sub-block that divides the page.
-        if self.kv_block_size & (self.kv_block_size - 1) != 0:
-            self.kv_block_size = self.kv_block_size & -self.kv_block_size
-        self.sub_blocks_per_page: int = self.block_size // self.kv_block_size
 
         self.max_model_len = self.model_config.max_model_len
         max_num_seqs = vllm_config.scheduler_config.max_num_seqs
         max_num_batched_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         self.max_num_query_groups = cdiv(max_num_batched_tokens, self.q_block_size)
         max_num_pages_per_seq = cdiv(self.max_model_len, self.block_size)
-        self.max_num_kv_indices = (
-            self.q_block_size * max_num_pages_per_seq * self.sub_blocks_per_page
-        )
+        self.max_num_kv_indices = self.q_block_size * max_num_pages_per_seq
         self.persistent_kv_num_blocks = torch.empty(
             self.max_num_query_groups, dtype=torch.int32, device=device
         )
@@ -933,7 +906,6 @@ class FlexAttentionMetadataBuilder(AttentionMetadataBuilder[FlexAttentionMetadat
             direct_build=self.direct_build and uses_paged_kv,
             q_block_size=self.q_block_size,
             kv_block_size=self.kv_block_size,
-            sub_blocks_per_page=self.sub_blocks_per_page,
             persistent_kv_indices=self.persistent_kv_indices,
             persistent_kv_num_blocks=self.persistent_kv_num_blocks,
             persistent_doc_ids=self.persistent_doc_ids,
@@ -1140,10 +1112,9 @@ class FlexAttentionImpl(AttentionImpl):
             assert self.attn_type == AttentionType.DECODER
             key_cache, value_cache = kv_cache.unbind(0)
 
-            # View out the block_size dim. Use reshape: DFlash draft layers
-            # may pass non-contiguous cache slices (e.g. TP-sliced caches).
-            key_cache = key_cache.reshape(-1, self.num_kv_heads, self.head_size)
-            value_cache = value_cache.reshape(-1, self.num_kv_heads, self.head_size)
+            # View out the block_size dim
+            key_cache = key_cache.view(-1, self.num_kv_heads, self.head_size)
+            value_cache = value_cache.view(-1, self.num_kv_heads, self.head_size)
             query, key_tensor, value_tensor = map(
                 lambda x: self.view_as_4d(x).permute(0, 2, 1, 3),
                 (query, key_cache, value_cache),

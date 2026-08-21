@@ -71,19 +71,6 @@ class DFlashProposer(SpecDecodeBaseProposer):
     @override
     def _create_draft_vllm_config(self) -> VllmConfig:
         base = super()._create_draft_vllm_config()
-        # Run the draft in its own model config so layer construction uses
-        # the draft checkpoint dtype (DFlash2 checkpoints are bf16 and their
-        # activations overflow fp16).
-        spec_cfg = self.speculative_config
-        base = replace(base, model_config=spec_cfg.draft_model_config)
-        # DFlash draft attention is non-causal; no backend supports
-        # non-causal attention with a quantized KV cache (e.g. the target's
-        # int8 KV). Pin the draft cache to fp16.
-        if base.cache_config.cache_dtype != "float16":
-            base = replace(
-                base,
-                cache_config=replace(base.cache_config, cache_dtype="float16"),
-            )
         return replace(
             base,
             attention_config=replace(
