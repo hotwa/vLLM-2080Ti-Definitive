@@ -8,7 +8,7 @@ The definitive vLLM runtime for dual RTX 2080 Ti / SM75 serving.
 This is a hardware-focused fork that preserves the patched source, launch
 profiles, and runtime notes needed to reproduce the working 2080 Ti vLLM stack.
 
-Fork release: `v0.1.15`
+Fork release: `v0.1.16`
 Base vLLM: `0.21.0`
 
 Headline evidence: the Qwen3.x 27B FP8 route is validated on official Qwen3.6
@@ -134,7 +134,7 @@ Qwen3.8 checkpoints listed below; other quantized rows remain checkpoint-specifi
   size 2
 - Validated host OS: Ubuntu 22.04/24.04 LTS or Debian 12, on Linux kernel 6.x
 - CUDA/PyTorch: CUDA 12.8, `torch 2.11.0+cu128`
-- Fork release: `v0.1.15`
+- Fork release: `v0.1.16`
 - Base vLLM: `0.21.0`
 - Repository identity: `vllm-2080ti-definitive`
 - Runtime identity: `vllm-sm75-tp2-cu128`
