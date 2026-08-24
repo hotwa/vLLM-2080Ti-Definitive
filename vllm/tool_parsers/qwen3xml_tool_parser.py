@@ -103,14 +103,24 @@ class StreamingXMLToolCallParser:
         # Record delta count before processing
         initial_delta_count = len(self.deltas)
 
-        unprocessed_start = self.last_processed_pos
+        chunk_start = len(self.streaming_buffer)
         self.streaming_buffer += xml_chunk
 
         found_elements = self._process_complete_xml_elements()
-        current_input_start = (
+        current_call_start = (
             self._current_call_search_pos
             if self._current_call_search_pos is not None
-            else unprocessed_start
+            else chunk_start
+        )
+        # Inspect only this chunk and enough preceding input to recognize a
+        # close marker split across chunks. Scanning an entire active call here
+        # turns a long streamed parameter into quadratic work.
+        close_tag_overlap = (
+            max(len(self.function_end_token), len(self.tool_call_end_token)) - 1
+        )
+        current_input_start = max(
+            current_call_start,
+            chunk_start - close_tag_overlap,
         )
         current_input = self.streaming_buffer[current_input_start:]
 
