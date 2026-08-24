@@ -53,3 +53,25 @@ def test_multiple_tool_calls_keep_close_tags_scoped_per_call():
         if call.function is not None and call.function.arguments
     ]
     assert sum(argument.count("}") for argument in arguments) == 2
+
+
+def test_close_tag_recovery_uses_active_call_region():
+    parser = StreamingXMLToolCallParser()
+    calls = _tool_calls(
+        parser,
+        [
+            "<tool_call><function=first><parameter=value>one</parameter>"
+            "</function></tool_call><tool_call><function=second>"
+            "<parameter=value>two</parameter></function>",
+            "</tool_call>",
+        ],
+    )
+
+    arguments = [
+        call.function.arguments
+        for call in calls
+        if call.function is not None and call.function.arguments
+    ]
+    assert len(arguments) == 2
+    assert all(argument.count("{") == 1 for argument in arguments)
+    assert all(argument.count("}") == 1 for argument in arguments)
