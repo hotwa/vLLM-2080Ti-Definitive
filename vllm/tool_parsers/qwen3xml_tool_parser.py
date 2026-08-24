@@ -60,6 +60,9 @@ class StreamingXMLToolCallParser:
         self.current_call_id = None
         self.last_completed_call_id = None
         self.current_function_name = ""
+        # A streaming tool call carries its function name only in the first
+        # delta. Subsequent deltas contain argument fragments.
+        self._function_name_emitted = False
         self.current_function_open = False
         self.parameters = {}
         self.current_param_name = None
@@ -593,6 +596,20 @@ class StreamingXMLToolCallParser:
 
     def _emit_delta(self, delta: DeltaMessage):
         """Emit Delta response (streaming output)"""
+        # The parser builds each argument fragment with the current function
+        # name for convenience. Normalize that at the emission boundary so a
+        # client never receives the name repeatedly on every chunk.
+        for tool_call in delta.tool_calls:
+            function = tool_call.function
+            if function is None or not function.name:
+                continue
+            if self._function_name_emitted:
+                # Do not keep an explicitly-set ``name=None`` field on
+                # continuation deltas. OpenAI serialization must omit the
+                # field entirely after the first delta.
+                tool_call.function = DeltaFunctionCall(arguments=function.arguments)
+            else:
+                self._function_name_emitted = True
         self.deltas.append(delta)
 
     def _auto_close_open_parameter_if_needed(self, incoming_tag: str | None = None):
@@ -644,6 +661,7 @@ class StreamingXMLToolCallParser:
             self._auto_close_open_parameter_if_needed("function")
             function_name = self._extract_function_name(name, attrs)
             self.current_function_name = function_name
+            self._function_name_emitted = False
             self.current_function_open = True
             if function_name:
                 delta = DeltaMessage(
@@ -1129,6 +1147,7 @@ class StreamingXMLToolCallParser:
             self.last_completed_call_id = self.current_call_id
         self.current_call_id = None
         self.current_function_name = ""
+        self._function_name_emitted = False
         self.current_function_open = False
         self.parameters = {}
         self.current_param_name = None
