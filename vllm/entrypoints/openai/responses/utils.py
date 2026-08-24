@@ -107,8 +107,22 @@ def construct_input_messages(
         ):
             first = input_messages[0]
             old_content = first.get("content")
-            if isinstance(old_content, str) and old_content:
-                first["content"] = f"{request_instructions}\n{old_content}"
+            if isinstance(old_content, str):
+                if old_content:
+                    first["content"] = f"{request_instructions}\n{old_content}"
+                else:
+                    first["content"] = request_instructions
+            elif isinstance(old_content, list):
+                # Non-string content (e.g. it still carries non-text parts
+                # such as images) must not be replaced: prepend the
+                # instructions as the first text part so the original parts
+                # are preserved.
+                if not old_content:
+                    first["content"] = request_instructions
+                else:
+                    first["content"] = [
+                        {"type": "text", "text": request_instructions}
+                    ] + list(old_content)
             else:
                 first["content"] = request_instructions
         else:
@@ -248,7 +262,11 @@ def _construct_single_message_from_response_item(
             content=item.get("output"),
             tool_call_id=item.get("call_id"),
         )
-    elif isinstance(item, dict) and item.get("type") == "message":
+    # A missing `type` defaults to "message" in the Responses API, so
+    # untyped message dicts (as some codex-style clients send them) must
+    # go through the same normalization; otherwise role="developer" would
+    # slip through unconverted and be rejected by chat templates.
+    elif isinstance(item, dict) and item.get("type", "message") == "message":
         # [local 2080ti fork] Normalize Responses-API input messages to
         # chat-template roles. Clients such as codex submit system context
         # as role="developer" (the OpenAI-recommended alias of "system"),
@@ -276,7 +294,10 @@ def _construct_single_message_from_response_item(
                     # carries them.
                     kept.append(part)
             if not kept:
-                content = "".join(texts)
+                # Newline-join (same separator as the instructions merge
+                # above) so part boundaries are preserved in the prompt
+                # instead of "first" + "second" becoming "firstsecond".
+                content = "\n".join(texts)
             else:
                 content = [{"type": "text", "text": t} for t in texts] + kept
         msg: dict = {"role": role, "content": content}
