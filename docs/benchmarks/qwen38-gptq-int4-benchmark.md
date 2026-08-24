@@ -1,10 +1,10 @@
 # Qwen3.8-27B GPTQ INT4 Benchmark Results
 
-**Date**: 2024-08-21
+**Date**: 2026-08-21
 
 **Hardware**: 2x RTX 2080 Ti 22GB, NVLink (NV2)
 
-**Software**: vLLM v0.1.15 (weicj/vLLM-2080Ti-Definitive)
+**Software**: vLLM v0.1.16 (weicj/vLLM-2080Ti-Definitive), base vLLM 0.21.0
 
 **Model**: [SergiioB/Qwen3.8-27B-GPTQ-Int4-sym-G128-MTP-BF16](https://huggingface.co/SergiioB/Qwen3.8-27B-GPTQ-Int4-sym-G128-MTP-BF16)
 
@@ -46,7 +46,7 @@
 | INT8 KV + noMTP | 1781.8 / 51.7 | 1741.4 / 54.7 | -2.3% / +5.8% |
 | FP16 KV + MTP3 | 1732.9 / 81.7 | **1690.7 / 126.2** | -2.4% / **+54.5%** |
 
-**Key Finding**: Qwen3.8 GPTQ INT4 with FP16 KV + MTP3 achieves **54% faster decode** than Qwen3.6!
+**Key Finding**: Qwen3.8 GPTQ INT4 with FP16 KV + MTP3 reaches **126.2 tok/s decode** at 4K PP/TG, **+54.5% vs Qwen3.6** (81.7 tok/s) measured with the same 4K PP/TG benchmark口径.
 
 ## GPTQ Marlin Verification
 
@@ -99,4 +99,4 @@ python -m vllm.entrypoints.openai.api_server \
 2. Marlin kernel is used for INT4 GEMM operations on SM75
 3. MTP head is preserved in BF16 for speculative decoding
 4. The model supports both text-only and text+image modes
-5. For longer contexts (>128K), use INT8 KV or YaRN scaling
+5. Only the 128K profiles are shipped and validated for Qwen3.8-27B in this PR. Long-context (>128K) INT8 KV / YaRN profiles exist for qwen27b, not yet for qwen38

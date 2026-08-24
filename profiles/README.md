@@ -79,10 +79,13 @@ Jackrong/Qwopus3.6-27B-v2-FP8 (about 29G for the latter).
 | Profile | Compatible modes | Context | KV | MTP | Messages | Seqs | Throughput |
 |---|---|---:|---|---:|---|---:|---:|
 | `qwen27b/normal/fp8/fp16kv-128K-mtp3-text-only.env` | normal | 128K | FP16 | 3 | text-only | 1 | 1619.48 / 84.71 |
+| `qwen27b/normal/fp8/fp16kv-138K-mtp3-text-only.env` | normal | 138K | FP16 | 3 | text-only | 1 | - [^qwen27b-fp8-138k] |
 | `qwen27b/normal/fp8/int8kv-252K-mtp3-text-only.env` | normal | 252K | INT8 | 3 | text-only | 1 | 1605.10 / 44.09 |
 | `qwen27b/fast/fp8/fp16kv-112K-mtp3-text-only.env` | fast | 112K | FP16 | 3 | text-only | 1 | 1615.58 / 83.69 |
 | `qwen27b/fast/fp8/tqk8v4-256K-mtp3-text-only.env` | fast | 256K | TQK8V4 | 3 | text-only | 1 | 1615.81 / 81.06 |
 | `qwen27b/fast/fp8/tqk8v4-240K-mtp3-text-image.env` | fast | 240K | TQK8V4 | 3 | text+image | 1 | 1605.61 / 80.67 |
+
+[^qwen27b-fp8-138k]: Route tracked for the MTP3 138K deployment; throughput not separately benchmarked in this PR (closest measured qwen27b FP8 MTP3 route: `fp16kv-128K`, 1619.48 / 84.71).
 
 ### Qwen3.x 35B
 
@@ -117,7 +120,7 @@ about 19G.
 Tested checkpoint: [SergiioB/Qwen3.8-27B-GPTQ-Int4-sym-G128-MTP-BF16](https://huggingface.co/SergiioB/Qwen3.8-27B-GPTQ-Int4-sym-G128-MTP-BF16),
 18.22 GB, GPTQ INT4 G128, MTP preserved in BF16.
 
-**Key finding**: Qwen3.8 GPTQ INT4 + FP16 KV + MTP3 achieves **54% faster decode** than Qwen3.6!
+**Key finding**: Qwen3.8 GPTQ INT4 + FP16 KV + MTP3 reaches **126.2 tok/s decode** at 4K PP/TG — **+54% vs Qwen3.6-27B** (81.7 tok/s) measured with the same 4K PP/TG benchmark口径. See the benchmark doc for the per-config comparison.
 
 | Profile | Compatible modes | Context | KV | MTP | Messages | Seqs | Throughput |
 |---|---|---:|---|---:|---|---:|---:|
