@@ -8,6 +8,8 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 RUNTIME_ROOT="${RUNTIME_ROOT:-$REPO_ROOT}"
 MODEL_DIR="${MODEL_DIR:-}"
 LOG_DIR="${LOG_DIR:-$RUNTIME_ROOT/run-logs}"
+HOST="${HOST:-0.0.0.0}"          # 监听地址，可用环境变量覆盖
+VLLM_API_KEY="${VLLM_API_KEY:-}" # 可选：非空时启用 API key 鉴权
 
 if [[ -z "$MODEL_DIR" ]]; then
   echo "MODEL_DIR must be set to the Qwen3.8-27B GPTQ INT4 checkpoint." >&2
@@ -20,7 +22,7 @@ fi
 mkdir -p "$LOG_DIR"
 
 "$RUNTIME_ROOT/.venv/bin/python" -m vllm.entrypoints.openai.api_server \
-  --host 127.0.0.1 \
+  --host "${HOST}" \
   --port 8000 \
   --model "$MODEL_DIR" \
   --served-model-name qwen38-gptq-fp16kv-128K-mtp3-text-only \
